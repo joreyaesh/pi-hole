@@ -308,8 +308,13 @@ diagnose_operating_system() {
     # If DOCKER_VERSION is set (Sourced from /etc/pihole/versions at start of script), include this information in the debug output
     [ -n "${DOCKER_VERSION}" ] && log_write "${INFO} Pi-hole Docker Container: ${DOCKER_VERSION}"
 
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        detected_os="macOS"
+        detected_version="$(sw_vers -productVersion 2>/dev/null || echo 'unknown')"
+        log_write "${INFO} OS: ${detected_os}"
+        log_write "${INFO} Version: ${detected_version}"
     # If there is a /etc/*release file, it's probably a supported operating system, so we can
-    if ls /etc/*release 1> /dev/null 2>&1; then
+    elif ls /etc/*release 1> /dev/null 2>&1; then
         # display the attributes to the user
 
         detected_os=$(grep "\bID\b" /etc/os-release | cut -d '=' -f2 | tr -d '"')
@@ -357,6 +362,16 @@ check_firewalld() {
     # FirewallD ships by default on Fedora/CentOS/RHEL and enabled upon clean install
     # FirewallD is not configured by the installer and is the responsibility of the user
     echo_current_diagnostic "FirewallD"
+    # macOS uses pf (packet filter) instead of firewalld
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        log_write "${INFO} ${COL_GREEN}macOS detected - using pf (Packet Filter) instead of FirewallD${COL_NC}";
+        if pfctl -s info 2>/dev/null | grep -q "Status: Enabled"; then
+            log_write "${INFO} ${COL_YELLOW}pf firewall is enabled${COL_NC}";
+        else
+            log_write "${TICK} ${COL_GREEN}pf firewall is not enabled or not accessible${COL_NC}";
+        fi
+        return
+    fi
     # Check if FirewallD service is enabled
     if command -v systemctl &> /dev/null; then
         # get its status via systemctl
@@ -409,6 +424,8 @@ hardware_check() {
     echo_current_diagnostic "System hardware configuration"
     if [ -n "${DOCKER_VERSION}" ]; then
         log_write "${skip_msg}"
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        run_and_print_command "system_profiler SPHardwareDataType"
     else
         # Store the output of the command in a variable
         run_and_print_command "lshw -short"
@@ -417,6 +434,8 @@ hardware_check() {
     echo_current_diagnostic "Processor details"
     if [ -n "${DOCKER_VERSION}" ]; then
         log_write "${skip_msg}"
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        run_and_print_command "sysctl -n machdep.cpu.brand_string"
     else
         # Store the output of the command in a variable
         run_and_print_command "lscpu"
@@ -477,19 +496,41 @@ ping_gateway() {
 
     log_write "${INFO} Default IPv${protocol} gateway(s):"
 
-    while IFS= read -r default_route; do
-        gateway_addr=$(jq -r '.gateway' <<< "${default_route}")
-        gateway_iface=$(jq -r '.dev' <<< "${default_route}")
-        log_write "     ${gateway_addr}%${gateway_iface}"
-    done < <(ip -j -"${protocol}" route | jq -c '.[] | select(.dst == "default")')
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        # macOS: use route and netstat instead of ip -j
+        local gateway_info
+        if [[ "${protocol}" == "4" ]]; then
+            gateway_info="$(netstat -rn -f inet 2>/dev/null | awk '/default/ {print $2, $NF}')"
+        else
+            gateway_info="$(netstat -rn -f inet6 2>/dev/null | awk '/default/ {print $2, $NF}')"
+        fi
+        while IFS= read -r line; do
+            gateway_addr="$(echo "${line}" | awk '{print $1}')"
+            gateway_iface="$(echo "${line}" | awk '{print $2}')"
+            log_write "     ${gateway_addr}%${gateway_iface}"
+        done <<< "${gateway_info}"
 
-    # Find the first default route
-    default_route=$(ip -j -"${protocol}" route show default)
-    if echo "$default_route" | grep 'gateway' | grep -q 'dev'; then
-        gateway_addr=$(echo "$default_route" | jq -r -c '.[0].gateway')
-        gateway_iface=$(echo "$default_route" | jq -r -c '.[0].dev')
+        # Find the first default route
+        if [[ -n "${gateway_addr}" ]]; then
+            : # gateway_addr already set above
+        else
+            log_write "     Unable to determine gateway address for IPv${protocol}"
+        fi
     else
-        log_write "     Unable to determine gateway address for IPv${protocol}"
+        while IFS= read -r default_route; do
+            gateway_addr=$(jq -r '.gateway' <<< "${default_route}")
+            gateway_iface=$(jq -r '.dev' <<< "${default_route}")
+            log_write "     ${gateway_addr}%${gateway_iface}"
+        done < <(ip -j -"${protocol}" route | jq -c '.[] | select(.dst == "default")')
+
+        # Find the first default route
+        default_route=$(ip -j -"${protocol}" route show default)
+        if echo "$default_route" | grep 'gateway' | grep -q 'dev'; then
+            gateway_addr=$(echo "$default_route" | jq -r -c '.[0].gateway')
+            gateway_iface=$(echo "$default_route" | jq -r -c '.[0].dev')
+        else
+            log_write "     Unable to determine gateway address for IPv${protocol}"
+        fi
     fi
 
     # If there was at least one gateway
@@ -526,14 +567,26 @@ ping_internet() {
     ping_ipv4_or_ipv6 "${protocol}"
     log_write "* Checking Internet connectivity via IPv${protocol}..."
     # Try to ping the address 3 times
-    if ! ${cmd} -c 1 -W 2 -n ${public_address} -I "${PIHOLE_INTERFACE}" >/dev/null; then
-        # if it's unsuccessful, show an error
-        log_write "${CROSS} ${COL_RED}Cannot reach the Internet.${COL_NC}\\n"
-        return 1
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        if ! ${cmd} -c 1 -W 2 -n ${public_address} >/dev/null; then
+            # if it's unsuccessful, show an error
+            log_write "${CROSS} ${COL_RED}Cannot reach the Internet.${COL_NC}\\n"
+            return 1
+        else
+            # Otherwise, show success
+            log_write "${TICK} ${COL_GREEN}Query responded.${COL_NC}\\n"
+            return 0
+        fi
     else
-        # Otherwise, show success
-        log_write "${TICK} ${COL_GREEN}Query responded.${COL_NC}\\n"
-        return 0
+        if ! ${cmd} -c 1 -W 2 -n ${public_address} -I "${PIHOLE_INTERFACE}" >/dev/null; then
+            # if it's unsuccessful, show an error
+            log_write "${CROSS} ${COL_RED}Cannot reach the Internet.${COL_NC}\\n"
+            return 1
+        else
+            # Otherwise, show success
+            log_write "${TICK} ${COL_GREEN}Query responded.${COL_NC}\\n"
+            return 0
+        fi
     fi
 }
 
@@ -561,6 +614,36 @@ check_required_ports() {
     # Since Pi-hole needs various ports, check what they are being used by
     # so we can detect any issues
     local ftl="pihole-FTL"
+
+    local ports_configured
+    # Get all configured ports
+    ports_configured="$(pihole-FTL --config "webserver.port")"
+    # Remove all non-didgits, split into an array at ","
+    ports_configured="${ports_configured//[!0-9,]/}"
+    mapfile -d "," -t ports_configured < <(echo "${ports_configured}")
+    # Add port 53
+    ports_configured+=("53")
+
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        # macOS: use lsof to check ports
+        for port in "${ports_configured[@]}"; do
+            local port_info
+            port_info="$(lsof -nP -iTCP:${port} -sTCP:LISTEN 2>/dev/null || true)"
+            if [[ -n "${port_info}" ]]; then
+                local service_name
+                service_name="$(echo "${port_info}" | awk 'NR==2{print $1}')"
+                compare_port_to_service_assigned "${ftl}" "${service_name}" "tcp:${port}"
+            fi
+            port_info="$(lsof -nP -iUDP:${port} 2>/dev/null || true)"
+            if [[ -n "${port_info}" ]]; then
+                local service_name
+                service_name="$(echo "${port_info}" | awk 'NR==2{print $1}')"
+                compare_port_to_service_assigned "${ftl}" "${service_name}" "udp:${port}"
+            fi
+        done
+        return
+    fi
+
     # Create an array for these ports in use
     ports_in_use=()
     # Sort the addresses and remove duplicates
@@ -604,7 +687,16 @@ ip_command() {
     # Obtain and log information from "ip XYZ show" commands
     echo_current_diagnostic "${2}"
     local entries=()
-    mapfile -t entries < <(ip "${1}" show)
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        # macOS: use ifconfig and netstat -rn instead of ip
+        if [[ "${1}" == "addr" ]]; then
+            mapfile -t entries < <(ifconfig)
+        elif [[ "${1}" == "route" ]]; then
+            mapfile -t entries < <(netstat -rn)
+        fi
+    else
+        mapfile -t entries < <(ip "${1}" show)
+    fi
     for line in "${entries[@]}"; do
         log_write "   ${line}"
     done

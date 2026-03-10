@@ -56,9 +56,14 @@ source "${PI_HOLE_LOCAL_REPO}/automated install/basic-install.sh"
 removeMetaPackage() {
     # Purge Pi-hole meta package
     echo ""
-    echo -ne "  ${INFO} Removing Pi-hole meta package...";
-    eval "${PKG_REMOVE}" "pihole-meta" &> /dev/null;
-    echo -e "${OVER}  ${INFO} Removed Pi-hole meta package";
+    if is_macos; then
+        echo -ne "  ${INFO} Pi-hole dependencies were installed via Homebrew.";
+        echo -e "${OVER}  ${INFO} You may remove them manually with 'brew uninstall <package>'";
+    else
+        echo -ne "  ${INFO} Removing Pi-hole meta package...";
+        eval "${PKG_REMOVE}" "pihole-meta" &> /dev/null;
+        echo -e "${OVER}  ${INFO} Removed Pi-hole meta package";
+    fi
 }
 
 removeWebInterface() {
@@ -76,24 +81,30 @@ removeFTL() {
         disable_service pihole-FTL
 
         echo -ne "  ${INFO} Removing pihole-FTL..."
-        rm -f /etc/systemd/system/pihole-FTL.service &> /dev/null
-        if [[ -d '/etc/systemd/system/pihole-FTL.service.d' ]]; then
-            read -rp "  ${QST} FTL service override directory /etc/systemd/system/pihole-FTL.service.d detected. Do you wish to remove this from your system? [y/N] " answer
-            case $answer in
-                [yY]*)
-                    echo -ne "  ${INFO} Removing /etc/systemd/system/pihole-FTL.service.d..."
-                    rm -R /etc/systemd/system/pihole-FTL.service.d &> /dev/null
-                    echo -e "${OVER}  ${INFO} Removed /etc/systemd/system/pihole-FTL.service.d"
-                ;;
-                *) echo -e "  ${INFO} Leaving /etc/systemd/system/pihole-FTL.service.d in place.";;
-            esac
+        if is_macos; then
+            # Remove launchd plist on macOS
+            rm -f /Library/LaunchDaemons/net.pi-hole.pihole-FTL.plist &> /dev/null
+            rm -f /usr/local/bin/pihole-FTL &> /dev/null
+        else
+            rm -f /etc/systemd/system/pihole-FTL.service &> /dev/null
+            if [[ -d '/etc/systemd/system/pihole-FTL.service.d' ]]; then
+                read -rp "  ${QST} FTL service override directory /etc/systemd/system/pihole-FTL.service.d detected. Do you wish to remove this from your system? [y/N] " answer
+                case $answer in
+                    [yY]*)
+                        echo -ne "  ${INFO} Removing /etc/systemd/system/pihole-FTL.service.d..."
+                        rm -R /etc/systemd/system/pihole-FTL.service.d &> /dev/null
+                        echo -e "${OVER}  ${INFO} Removed /etc/systemd/system/pihole-FTL.service.d"
+                    ;;
+                    *) echo -e "  ${INFO} Leaving /etc/systemd/system/pihole-FTL.service.d in place.";;
+                esac
+            fi
+            rm -f /etc/init.d/pihole-FTL &> /dev/null
+            rm -f /usr/bin/pihole-FTL &> /dev/null
         fi
-        rm -f /etc/init.d/pihole-FTL &> /dev/null
-        rm -f /usr/bin/pihole-FTL &> /dev/null
         echo -e "${OVER}  ${TICK} Removed pihole-FTL"
 
         # Force systemd reload after service files are removed
-        if is_command "systemctl"; then
+        if ! is_macos && is_command "systemctl"; then
             echo -ne "  ${INFO} Restarting systemd..."
             systemctl daemon-reload
             echo -e "${OVER}  ${TICK} Restarted systemd..."
@@ -106,6 +117,19 @@ removeCronFiles() {
     # to guarantee no additional changes were made to /etc/crontab after
     # the installation of pihole, /etc/crontab.pihole should be permanently
     # preserved.
+    if is_macos; then
+        # On macOS, remove Pi-hole entries from root's crontab
+        local existingCron
+        existingCron=$(crontab -l 2>/dev/null | grep -v "pihole" | grep -v "Pi-hole" || true)
+        if [[ -n "${existingCron}" ]]; then
+            echo "${existingCron}" | crontab -
+        else
+            crontab -r 2>/dev/null || true
+        fi
+        echo -e "  ${TICK} Removed Pi-hole cron entries"
+        return
+    fi
+
     if [[ -f /etc/crontab.orig ]]; then
         mv /etc/crontab /etc/crontab.pihole
         mv /etc/crontab.orig /etc/crontab
@@ -151,6 +175,12 @@ removePiholeFiles() {
     # remove Pi-hole's bash completion
     rm -f /etc/bash_completion.d/pihole &> /dev/null
     rm -f /etc/bash_completion.d/pihole-FTL &> /dev/null
+    if is_macos; then
+        local brew_prefix
+        brew_prefix="$(brew --prefix 2>/dev/null || echo '/usr/local')"
+        rm -f "${brew_prefix}/etc/bash_completion.d/pihole" &> /dev/null
+        rm -f "${brew_prefix}/etc/bash_completion.d/pihole-FTL" &> /dev/null
+    fi
 
     # Remove pihole from sudoers for compatibility with old versions
     rm -f /etc/sudoers.d/pihole &> /dev/null
@@ -171,6 +201,25 @@ removeManPage() {
 }
 
 removeUser() {
+    if is_macos; then
+        # macOS user/group removal via dscl
+        if dscl . -read /Users/pihole &>/dev/null; then
+            if dscl . -delete /Users/pihole 2>/dev/null; then
+                echo -e "  ${TICK} Removed 'pihole' user"
+            else
+                echo -e "  ${CROSS} Unable to remove 'pihole' user"
+            fi
+        fi
+        if dscl . -read /Groups/pihole &>/dev/null; then
+            if dscl . -delete /Groups/pihole 2>/dev/null; then
+                echo -e "  ${TICK} Removed 'pihole' group"
+            else
+                echo -e "  ${CROSS} Unable to remove 'pihole' group"
+            fi
+        fi
+        return
+    fi
+
     # If the pihole user exists, then remove
     if id "pihole" &> /dev/null; then
         if userdel -r pihole 2> /dev/null; then
@@ -191,6 +240,10 @@ removeUser() {
 }
 
 restoreResolved() {
+    # No systemd-resolved on macOS
+    if is_macos; then
+        return
+    fi
     # Restore Resolved from saved configuration, if present
     if [[ -e /etc/systemd/resolved.conf.orig ]] || [[ -e /etc/systemd/resolved.conf.d/90-pi-hole-disable-stub-listener.conf ]]; then
         cp -p /etc/systemd/resolved.conf.orig /etc/systemd/resolved.conf &> /dev/null || true

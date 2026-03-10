@@ -11,7 +11,11 @@ FTL_PID_FILE="$(getFTLConfigValue files.pid)"
 FTL_LOG_FILE="$(getFTLConfigValue files.log.ftl)"
 PIHOLE_LOG_FILE="$(getFTLConfigValue files.log.dnsmasq)"
 WEBSERVER_LOG_FILE="$(getFTLConfigValue files.log.webserver)"
-FTL_PID_FILE="${FTL_PID_FILE:-/run/pihole-FTL.pid}"
+if is_macos; then
+    FTL_PID_FILE="${FTL_PID_FILE:-/var/run/pihole-FTL.pid}"
+else
+    FTL_PID_FILE="${FTL_PID_FILE:-/run/pihole-FTL.pid}"
+fi
 FTL_LOG_FILE="${FTL_LOG_FILE:-/var/log/pihole/FTL.log}"
 PIHOLE_LOG_FILE="${PIHOLE_LOG_FILE:-/var/log/pihole/pihole.log}"
 WEBSERVER_LOG_FILE="${WEBSERVER_LOG_FILE:-/var/log/pihole/webserver.log}"
@@ -32,7 +36,11 @@ find /etc/pihole/ /var/log/pihole/ -type f ! \( -name '*.pem' -o -name '*.crt' \
 find /etc/pihole/ -type f \( -name '*.pem' -o -name '*.crt' \) -exec chmod 0600 {} +
 
 # Logrotate config file need to be owned by root
-chown root:root /etc/pihole/logrotate
+if is_macos; then
+    chown root:wheel /etc/pihole/logrotate 2>/dev/null || true
+else
+    chown root:root /etc/pihole/logrotate
+fi
 
 # Touch files to ensure they exist (create if non-existing, preserve if existing)
 [ -f "${FTL_PID_FILE}" ] || install -D -m 644 -o pihole -g pihole /dev/null "${FTL_PID_FILE}"
