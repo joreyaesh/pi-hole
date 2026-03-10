@@ -16,6 +16,28 @@
 #  - New functions must have a test added for them in test/test_any_utils.py
 
 #######################
+# Detect if running on macOS
+# Returns 0 if macOS, 1 otherwise
+#######################
+is_macos() {
+  [ "$(uname -s)" = "Darwin" ]
+}
+
+#######################
+# Portable sed in-place editing.
+# macOS (BSD) sed requires a backup extension argument with -i,
+# while GNU sed does not.
+# Usage: sed_i 's/foo/bar/' file
+#######################
+sed_i() {
+  if is_macos; then
+    sed -i '' "$@"
+  else
+    sed -i "$@"
+  fi
+}
+
+#######################
 # Takes Three arguments: file, key, and value.
 #
 # Checks the target file for the existence of the key
@@ -35,7 +57,7 @@ addOrEditKeyValPair() {
 
   if grep -q "^${key}=" "${file}"; then
     # Key already exists in file, modify the value
-    sed -i "/^${key}=/c\\${key}=${value}" "${file}"
+    sed_i "/^${key}=/c\\${key}=${value}" "${file}"
   else
     # Key does not already exist, add it and it's value
     echo "${key}=${value}" >> "${file}"

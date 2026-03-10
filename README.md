@@ -5,7 +5,7 @@
 <p align="center">
   <img src="https://raw.githubusercontent.com/pi-hole/graphics/refs/heads/master/Vortex/vortex_with_text.svg" alt="Pi-hole website" width="168" height="270">
   <br>
-  <strong>Network-wide ad blocking via your own Linux hardware</strong>
+  <strong>Network-wide ad blocking via your own hardware</strong>
 </p>
 
 <!-- markdownlint-enable MD033 -->
@@ -55,6 +55,20 @@ sudo bash basic-install.sh
 ### Method 3: Using Docker to deploy Pi-hole
 
 Please refer to the [Pi-hole docker repo](https://github.com/pi-hole/docker-pi-hole) to use the Official Docker Images.
+
+### macOS Installation
+
+Pi-hole can also be installed natively on macOS. [Homebrew](https://brew.sh/) is required for dependency management:
+
+```bash
+# Install Homebrew if not already installed
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Then install Pi-hole
+curl -sSL https://install.pi-hole.net | bash
+```
+
+Pi-hole on macOS uses `launchd` for service management instead of `systemd`, and installs dependencies via Homebrew. Both Apple Silicon (arm64) and Intel (x86_64) Macs are supported.
 
 ## [Post-install: Make your network take advantage of Pi-hole](https://docs.pi-hole.net/main/post-install/)
 

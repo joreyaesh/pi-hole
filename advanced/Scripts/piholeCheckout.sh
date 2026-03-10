@@ -199,12 +199,22 @@ checkout() {
             # Wait until name resolution is working again after restarting FTL,
             # so that the updatechecker can run successfully and does not fail
             # trying to resolve github.com
-            until getent hosts github.com &> /dev/null; do
-                # Append one dot for each second waiting
-                str="${str}."
-                echo -ne "  ${OVER}  ${INFO} ${str}"
-                sleep 1
-            done
+            if is_macos; then
+                # macOS doesn't have getent; use dscacheutil or host command
+                until host github.com &> /dev/null; do
+                    # Append one dot for each second waiting
+                    str="${str}."
+                    echo -ne "  ${OVER}  ${INFO} ${str}"
+                    sleep 1
+                done
+            else
+                until getent hosts github.com &> /dev/null; do
+                    # Append one dot for each second waiting
+                    str="${str}."
+                    echo -ne "  ${OVER}  ${INFO} ${str}"
+                    sleep 1
+                done
+            fi
             echo -e "  ${OVER}  ${TICK} Restarted FTL service"
 
             # Update local and remote versions via updatechecker

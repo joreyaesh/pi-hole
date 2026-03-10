@@ -321,27 +321,54 @@ analyze_ports() {
   # function is getting called
   # Check individual address family/protocol combinations
   # For a healthy Pi-hole, they should all be up (nothing printed)
-  lv4="$(ss --ipv4 --listening --numeric --tcp --udp src :${port})"
-  if grep -q "udp " <<< "${lv4}"; then
-      echo -e "     ${TICK} UDP (IPv4)"
+  if is_macos; then
+    # macOS: use lsof instead of ss
+    lv4="$(lsof -nP -iTCP:${port} -sTCP:LISTEN 2>/dev/null || true)"
+    if echo "${lv4}" | grep -q "IPv4"; then
+        echo -e "     ${TICK} TCP (IPv4)"
+    else
+        echo -e "     ${CROSS} TCP (IPv4)"
+    fi
+    if echo "${lv4}" | grep -q "IPv6"; then
+        echo -e "     ${TICK} TCP (IPv6)"
+    else
+        echo -e "     ${CROSS} TCP (IPv6)"
+    fi
+    local ludp
+    ludp="$(lsof -nP -iUDP:${port} 2>/dev/null || true)"
+    if echo "${ludp}" | grep -q "IPv4"; then
+        echo -e "     ${TICK} UDP (IPv4)"
+    else
+        echo -e "     ${CROSS} UDP (IPv4)"
+    fi
+    if echo "${ludp}" | grep -q "IPv6"; then
+        echo -e "     ${TICK} UDP (IPv6)"
+    else
+        echo -e "     ${CROSS} UDP (IPv6)"
+    fi
   else
-      echo -e "     ${CROSS} UDP (IPv4)"
-  fi
-  if grep -q "tcp " <<< "${lv4}"; then
-      echo -e "     ${TICK} TCP (IPv4)"
-  else
-      echo -e "     ${CROSS} TCP (IPv4)"
-  fi
-  lv6="$(ss --ipv6 --listening --numeric --tcp --udp src :${port})"
-  if grep -q "udp " <<< "${lv6}"; then
-      echo -e "     ${TICK} UDP (IPv6)"
-  else
-      echo -e "     ${CROSS} UDP (IPv6)"
-  fi
-  if grep -q "tcp " <<< "${lv6}"; then
-      echo -e "     ${TICK} TCP (IPv6)"
-  else
-      echo -e "     ${CROSS} TCP (IPv6)"
+    lv4="$(ss --ipv4 --listening --numeric --tcp --udp src :${port})"
+    if grep -q "udp " <<< "${lv4}"; then
+        echo -e "     ${TICK} UDP (IPv4)"
+    else
+        echo -e "     ${CROSS} UDP (IPv4)"
+    fi
+    if grep -q "tcp " <<< "${lv4}"; then
+        echo -e "     ${TICK} TCP (IPv4)"
+    else
+        echo -e "     ${CROSS} TCP (IPv4)"
+    fi
+    lv6="$(ss --ipv6 --listening --numeric --tcp --udp src :${port})"
+    if grep -q "udp " <<< "${lv6}"; then
+        echo -e "     ${TICK} UDP (IPv6)"
+    else
+        echo -e "     ${CROSS} UDP (IPv6)"
+    fi
+    if grep -q "tcp " <<< "${lv6}"; then
+        echo -e "     ${TICK} TCP (IPv6)"
+    else
+        echo -e "     ${CROSS} TCP (IPv6)"
+    fi
   fi
   echo ""
 }

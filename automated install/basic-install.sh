@@ -11,7 +11,7 @@
 
 # pi-hole.net/donate
 #
-# Install with this command (from your Linux machine):
+# Install with this command (from your Linux or macOS machine):
 #
 # curl -sSL https://install.pi-hole.net | bash
 
@@ -23,6 +23,8 @@ set -e
 # Append common folders to the PATH to ensure that all basic commands are available.
 # When using "su" an incomplete PATH could be passed: https://github.com/pi-hole/pi-hole/issues/3209
 export PATH+=':/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+# Add Homebrew paths for macOS (Apple Silicon and Intel)
+export PATH+=':/opt/homebrew/bin:/opt/homebrew/sbin'
 
 # Trap any errors, then exit
 trap abort INT QUIT TERM
@@ -183,6 +185,23 @@ PIHOLE_META_DEPS_APK=(
     unzip
 )
 
+# List of required Homebrew formulae on macOS
+PIHOLE_HOMEBREW_DEPS=(
+    bash
+    bash-completion@2
+    bind         # for dig/nslookup
+    binutils
+    coreutils
+    curl
+    dialog
+    git
+    grep
+    jq
+    sqlite
+    sudo
+    unzip
+)
+
 ######## Undocumented Flags. Shhh ########
 # These are undocumented flags; some of which we can use when repairing an installation
 # The runUnattended flag is one example of this
@@ -261,6 +280,20 @@ is_command() {
     command -v "${check_command}" >/dev/null 2>&1
 }
 
+# Detect if running on macOS (Darwin)
+is_macos() {
+    [[ "$(uname -s)" == "Darwin" ]]
+}
+
+# Portable sed in-place editing for macOS (BSD) and GNU sed compatibility
+sed_i() {
+    if is_macos; then
+        sed -i '' "$@"
+    else
+        sed -i "$@"
+    fi
+}
+
 check_fresh_install() {
     # in case of an update (can be a v5 -> v6 or v6 -> v6 update) or repair
     if [[ -f "${PI_HOLE_V6_CONFIG}" ]] || [[ -f "/etc/pihole/setupVars.conf" ]]; then
@@ -309,6 +342,14 @@ package_manager_detect() {
         PKG_COUNT="${PKG_MANAGER} list --upgradable -q | wc -l"
         PKG_REMOVE="${PKG_MANAGER} del"
 
+    # If on macOS, check for Homebrew.
+    elif is_macos && is_command brew; then
+        PKG_MANAGER="brew"
+        UPDATE_PKG_CACHE="brew update"
+        PKG_INSTALL="brew install"
+        PKG_COUNT="brew outdated --quiet | wc -l | tr -d ' '"
+        PKG_REMOVE="brew uninstall"
+
     else
         # we cannot install required packages
         printf "  %b No supported package manager found\\n" "${CROSS}"
@@ -321,6 +362,13 @@ build_dependency_package(){
     # This function will build a package that contains all the dependencies needed for Pi-hole
     if is_command apk ; then
         local str="APK based system detected. Dependencies will be installed using a virtual package named pihole-meta"
+        printf "  %b %s...\\n" "${INFO}" "${str}"
+        return 0
+    fi
+
+    # On macOS, dependencies are installed directly via Homebrew (no meta package needed)
+    if is_macos; then
+        local str="macOS detected. Dependencies will be installed via Homebrew"
         printf "  %b %s...\\n" "${INFO}" "${str}"
         return 0
     fi
@@ -581,25 +629,65 @@ find_IPv4_information() {
     local route
     local IPv4bare
 
-    # Find IP used to route to outside world by checking the route to Google's public DNS server
-    if ! route="$(ip route get 8.8.8.8 2> /dev/null)"; then
-        printf "  %b No IPv4 route was detected.\n" "${INFO}"
-        IPV4_ADDRESS=""
-        return
+    if is_macos; then
+        # macOS: use route to find the default interface and its IPv4 address
+        if ! route="$(route -n get 8.8.8.8 2> /dev/null)"; then
+            printf "  %b No IPv4 route was detected.\n" "${INFO}"
+            IPV4_ADDRESS=""
+            return
+        fi
+        # Extract the interface name
+        local iface
+        iface="$(echo "${route}" | awk '/interface:/ {print $2}')"
+        # Get the IP address from ifconfig
+        IPv4bare="$(ifconfig "${iface}" 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $2}' | head -1)"
+
+        if ! valid_ip "${IPv4bare}"; then
+            IPv4bare="127.0.0.1"
+        fi
+
+        # On macOS, get the CIDR from ifconfig
+        local netmask
+        netmask="$(ifconfig "${iface}" 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $4}' | head -1)"
+        if [[ -n "${netmask}" ]]; then
+            # Convert hex netmask (0xffffff00) to CIDR prefix length
+            # Count the number of 1 bits in the binary representation
+            local cidr=0
+            local hex_mask="${netmask#0x}"
+            for (( i=0; i<${#hex_mask}; i++ )); do
+                local nibble="0x${hex_mask:${i}:1}"
+                local val=$((nibble))
+                # Count set bits in each nibble (4-bit value)
+                while [[ ${val} -gt 0 ]]; do
+                    cidr=$((cidr + (val & 1)))
+                    val=$((val >> 1))
+                done
+            done
+            IPV4_ADDRESS="${IPv4bare}/${cidr}"
+        else
+            IPV4_ADDRESS="${IPv4bare}/24"
+        fi
+    else
+        # Find IP used to route to outside world by checking the route to Google's public DNS server
+        if ! route="$(ip route get 8.8.8.8 2> /dev/null)"; then
+            printf "  %b No IPv4 route was detected.\n" "${INFO}"
+            IPV4_ADDRESS=""
+            return
+        fi
+
+        # Get just the interface IPv4 address
+        # shellcheck disable=SC2059,SC2086
+        # disabled as we intentionally want to split on whitespace and have printf populate
+        # the variable with just the first field.
+        printf -v IPv4bare "$(printf ${route#*src })"
+
+        if ! valid_ip "${IPv4bare}"; then
+            IPv4bare="127.0.0.1"
+        fi
+
+        # Append the CIDR notation to the IP address, if valid_ip fails this should return 127.0.0.1/8
+        IPV4_ADDRESS=$(ip -oneline -family inet address show | grep "${IPv4bare}/" | awk '{print $4}' | awk 'END {print}')
     fi
-
-    # Get just the interface IPv4 address
-    # shellcheck disable=SC2059,SC2086
-    # disabled as we intentionally want to split on whitespace and have printf populate
-    # the variable with just the first field.
-    printf -v IPv4bare "$(printf ${route#*src })"
-
-    if ! valid_ip "${IPv4bare}"; then
-        IPv4bare="127.0.0.1"
-    fi
-
-    # Append the CIDR notation to the IP address, if valid_ip fails this should return 127.0.0.1/8
-    IPV4_ADDRESS=$(ip -oneline -family inet address show | grep "${IPv4bare}/" | awk '{print $4}' | awk 'END {print}')
 }
 
 confirm_ipv6_only() {
@@ -627,10 +715,20 @@ Do you wish to continue with an IPv6-only installation?\\n\\n" \
 # Get available interfaces that are UP
 get_available_interfaces() {
     # There may be more than one so it's all stored in a variable
-    # The ip command list all interfaces that are in the up state
-    # The awk command filters out any interfaces that have the LOOPBACK flag set
-    # while using the characters ": " or "@" as a field separator for awk
-    availableInterfaces=$(ip --oneline link show up | awk -F ': |@' '!/<.*LOOPBACK.*>/ {print $2}')
+    if is_macos; then
+        # On macOS, use networksetup and ifconfig to find active interfaces
+        availableInterfaces=$(ifconfig -l -u | tr ' ' '\n' | grep -v '^lo' | while read -r iface; do
+            # Only include interfaces that have an IP address (are actually active)
+            if ifconfig "${iface}" 2>/dev/null | grep -q "inet "; then
+                echo "${iface}"
+            fi
+        done)
+    else
+        # The ip command list all interfaces that are in the up state
+        # The awk command filters out any interfaces that have the LOOPBACK flag set
+        # while using the characters ": " or "@" as a field separator for awk
+        availableInterfaces=$(ip --oneline link show up | awk -F ': |@' '!/<.*LOOPBACK.*>/ {print $2}')
+    fi
 }
 
 # A function for displaying the dialogs the user sees when first running the installer
@@ -741,7 +839,12 @@ testIPv6() {
 
 find_IPv6_information() {
     # Detects IPv6 address used for communication to WAN addresses.
-    mapfile -t IPV6_ADDRESSES <<<"$(ip -6 address | grep 'scope global' | awk '{print $2}')"
+    if is_macos; then
+        # On macOS, use ifconfig to find global IPv6 addresses
+        mapfile -t IPV6_ADDRESSES <<<"$(ifconfig 2>/dev/null | awk '/inet6/ && !/fe80/ && !/::1/ {print $2}' | sed 's/%.*$//')"
+    else
+        mapfile -t IPV6_ADDRESSES <<<"$(ip -6 address | grep 'scope global' | awk '{print $2}')"
+    fi
 
     # For each address in the array above, determine the type of IPv6 address it is
     for i in "${IPV6_ADDRESSES[@]}"; do
@@ -1121,7 +1224,7 @@ remove_old_pihole_lighttpd_configs() {
     local confenabled="/etc/lighttpd/conf-enabled/15-pihole-admin.conf"
 
     if [[ -f "${lighttpdConfig}" ]]; then
-        sed -i '/include "\/etc\/lighttpd\/conf.d\/pihole-admin.conf"/d' "${lighttpdConfig}"
+        sed_i '/include "\/etc\/lighttpd\/conf.d\/pihole-admin.conf"/d' "${lighttpdConfig}"
     fi
 
     if [[ -f "${condfd}" ]]; then
@@ -1182,8 +1285,16 @@ installScripts() {
         install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" ./automated\ install/uninstall.sh
         install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" ./advanced/Scripts/COL_TABLE
         install -o "${USER}" -Dm755 -t "${PI_HOLE_BIN_DIR}" pihole
-        install -Dm644 ./advanced/bash-completion/pihole.bash /etc/bash_completion.d/pihole
-        install -Dm644 ./advanced/bash-completion/pihole-ftl.bash /etc/bash_completion.d/pihole-FTL
+        if is_macos; then
+            # macOS: Install bash completion to Homebrew's bash-completion directory
+            local brew_prefix
+            brew_prefix="$(brew --prefix 2>/dev/null || echo '/usr/local')"
+            install -Dm644 ./advanced/bash-completion/pihole.bash "${brew_prefix}/etc/bash_completion.d/pihole"
+            install -Dm644 ./advanced/bash-completion/pihole-ftl.bash "${brew_prefix}/etc/bash_completion.d/pihole-FTL"
+        else
+            install -Dm644 ./advanced/bash-completion/pihole.bash /etc/bash_completion.d/pihole
+            install -Dm644 ./advanced/bash-completion/pihole-ftl.bash /etc/bash_completion.d/pihole-FTL
+        fi
         printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
 
     else
@@ -1209,8 +1320,11 @@ installConfigs() {
         fi
     fi
 
-    # Install pihole-FTL systemd or init.d service, based on whether systemd is the init system or not
-    if ps -p 1 -o comm= | grep -q systemd; then
+    # Install pihole-FTL service based on the init system
+    if is_macos; then
+        # macOS: Install launchd plist
+        install -m 0644 "${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole-FTL.plist" '/Library/LaunchDaemons/net.pi-hole.pihole-FTL.plist'
+    elif ps -p 1 -o comm= | grep -q systemd; then
         install -T -m 0644 "${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole-FTL.systemd" '/etc/systemd/system/pihole-FTL.service'
 
         # Remove init.d service if present
@@ -1238,6 +1352,15 @@ install_manpage() {
     # Default location for man files for /usr/local/bin is /usr/local/share/man
     # on lightweight systems may not be present, so check before copying.
     printf "  %b Testing man page installation" "${INFO}"
+    if is_macos; then
+        # macOS has man support built-in, no mandb needed
+        if [[ ! -d "/usr/local/share/man/man8" ]]; then
+            install -d -m 755 /usr/local/share/man/man8
+        fi
+        install -m 644 ${PI_HOLE_LOCAL_REPO}/manpages/pihole.8 /usr/local/share/man/man8/pihole.8
+        printf "%b  %b man pages installed\\n" "${OVER}" "${TICK}"
+        return
+    fi
     if ! is_command mandb; then
         # if mandb is not present, no manpage support
         printf "%b  %b man not installed\\n" "${OVER}" "${INFO}"
@@ -1279,7 +1402,9 @@ stop_service() {
     # Can softfail, as process may not be installed when this is called
     local str="Stopping ${1} service"
     printf "  %b %s..." "${INFO}" "${str}"
-    if is_command systemctl; then
+    if is_macos; then
+        launchctl bootout system "/Library/LaunchDaemons/net.pi-hole.${1}.plist" 2>/dev/null || true
+    elif is_command systemctl; then
         systemctl -q stop "${1}" || true
     else
         service "${1}" stop >/dev/null || true
@@ -1292,8 +1417,11 @@ restart_service() {
     # Local, named variables
     local str="Restarting ${1} service"
     printf "  %b %s..." "${INFO}" "${str}"
-    # If systemctl exists,
-    if is_command systemctl; then
+    if is_macos; then
+        local plist="/Library/LaunchDaemons/net.pi-hole.${1}.plist"
+        launchctl bootout system "${plist}" 2>/dev/null || true
+        launchctl bootstrap system "${plist}"
+    elif is_command systemctl; then
         # use that to restart the service
         systemctl -q restart "${1}"
     else
@@ -1308,8 +1436,10 @@ enable_service() {
     # Local, named variables
     local str="Enabling ${1} service to start on reboot"
     printf "  %b %s..." "${INFO}" "${str}"
-    # If systemctl exists,
-    if is_command systemctl; then
+    if is_macos; then
+        # On macOS, launchd services in /Library/LaunchDaemons with RunAtLoad are auto-enabled
+        launchctl bootstrap system "/Library/LaunchDaemons/net.pi-hole.${1}.plist" 2>/dev/null || true
+    elif is_command systemctl; then
         # use that to enable the service
         systemctl -q enable "${1}"
     elif is_command openrc; then
@@ -1326,8 +1456,9 @@ disable_service() {
     # Local, named variables
     local str="Disabling ${1} service"
     printf "  %b %s..." "${INFO}" "${str}"
-    # If systemctl exists,
-    if is_command systemctl; then
+    if is_macos; then
+        launchctl bootout system "/Library/LaunchDaemons/net.pi-hole.${1}.plist" 2>/dev/null || true
+    elif is_command systemctl; then
         # use that to disable the service
         systemctl -q disable --now "${1}"
     elif is_command openrc; then
@@ -1341,8 +1472,9 @@ disable_service() {
 }
 
 check_service_active() {
-    # If systemctl exists,
-    if is_command systemctl; then
+    if is_macos; then
+        launchctl print system/net.pi-hole."${1}" &>/dev/null
+    elif is_command systemctl; then
         # use that to check the status of the service
         systemctl -q is-enabled "${1}" 2>/dev/null
     elif is_command openrc; then
@@ -1355,6 +1487,10 @@ check_service_active() {
 
 # Systemd-resolved's DNSStubListener and ftl can't share port 53.
 disable_resolved_stublistener() {
+    # macOS does not have systemd-resolved
+    if is_macos; then
+        return
+    fi
     printf "  %b Testing if systemd-resolved is enabled\\n" "${INFO}"
     # Check if Systemd-resolved's DNSStubListener is enabled and active on port 53
     if check_service_active "systemd-resolved"; then
@@ -1469,6 +1605,24 @@ install_dependent_packages() {
             printf "  %b Error: Unable to install Pi-hole dependency package.\\n" "${COL_RED}"
             return 1
         fi
+    # Install macOS packages via Homebrew
+    elif is_macos && is_command brew; then
+        printf "%b  %b Installing dependencies via Homebrew...\\n" "${OVER}" "${INFO}"
+        local failed=false
+        for formula in "${PIHOLE_HOMEBREW_DEPS[@]}"; do
+            if ! brew list "${formula}" &>/dev/null; then
+                if ! brew install "${formula}" &>/dev/null; then
+                    printf "  %b Failed to install %s\\n" "${CROSS}" "${formula}"
+                    failed=true
+                fi
+            fi
+        done
+        if [[ "${failed}" == true ]]; then
+            printf "%b  %b %s\\n" "${OVER}" "${CROSS}" "${str}"
+            printf "  %b Error: Unable to install some Pi-hole dependencies via Homebrew.\\n" "${COL_RED}"
+            return 1
+        fi
+        printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
     else
         # we cannot install the dependency package
         printf "  %b No supported package manager found\\n" "${CROSS}"
@@ -1485,22 +1639,50 @@ installCron() {
     # Install the cron job
     local str="Installing latest Cron script"
     printf "\\n  %b %s..." "${INFO}" "${str}"
-    # Copy the cron file over from the local repo
-    # File must not be world or group writeable and must be owned by root
-    install -D -m 644 -T -o root -g root ${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole.cron /etc/cron.d/pihole
-    # Randomize gravity update time
-    sed -i "s/59 1 /$((1 + RANDOM % 58)) $((3 + RANDOM % 2))/" /etc/cron.d/pihole
-    # Randomize update checker time
-    sed -i "s/59 17/$((1 + RANDOM % 58)) $((12 + RANDOM % 8))/" /etc/cron.d/pihole
-    printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
 
-    # Switch off of busybox cron on alpine
-    if is_command openrc; then
-        printf "  %b Switching from busybox crond to cronie...\\n" "${INFO}"
-        stop_service crond
-        disable_service crond
-        enable_service cronie
-        restart_service cronie
+    if is_macos; then
+        # macOS: Install cron jobs using the user's crontab for root
+        # Create a temporary cron file based on the template
+        local tempCron
+        tempCron=$(mktemp /tmp/pihole_cron.XXXXXX)
+        cp "${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole.cron" "${tempCron}"
+        # Randomize gravity update time
+        sed -i '' "s/59 1 /$((1 + RANDOM % 58)) $((3 + RANDOM % 2))/" "${tempCron}"
+        # Randomize update checker time
+        sed -i '' "s/59 17/$((1 + RANDOM % 58)) $((12 + RANDOM % 8))/" "${tempCron}"
+        # Remove the username field from cron entries (macOS crontab doesn't use it)
+        # Handle standard 5-field entries (e.g., "59 1 * * 7  root  command")
+        sed -i '' 's/^\([0-9][^ ]* [^ ]* [^ ]* [^ ]* [^ ]*\)  *root */\1 /' "${tempCron}"
+        # Handle special time specifications (e.g., "@reboot root command")
+        sed -i '' 's/^\(@[a-zA-Z]*\)  *root */\1 /' "${tempCron}"
+        # Install as root's crontab (merge with existing)
+        local existingCron
+        existingCron=$(crontab -l 2>/dev/null | grep -v "pihole" || true)
+        {
+            echo "${existingCron}"
+            echo "# Pi-hole cron jobs"
+            grep -v "^#" "${tempCron}" | grep -v "^$"
+        } | crontab -
+        rm -f "${tempCron}"
+        printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
+    else
+        # Copy the cron file over from the local repo
+        # File must not be world or group writeable and must be owned by root
+        install -D -m 644 -T -o root -g root ${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole.cron /etc/cron.d/pihole
+        # Randomize gravity update time
+        sed -i "s/59 1 /$((1 + RANDOM % 58)) $((3 + RANDOM % 2))/" /etc/cron.d/pihole
+        # Randomize update checker time
+        sed -i "s/59 17/$((1 + RANDOM % 58)) $((12 + RANDOM % 8))/" /etc/cron.d/pihole
+        printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
+
+        # Switch off of busybox cron on alpine
+        if is_command openrc; then
+            printf "  %b Switching from busybox crond to cronie...\\n" "${INFO}"
+            stop_service crond
+            disable_service crond
+            enable_service cronie
+            restart_service cronie
+        fi
     fi
 }
 
@@ -1515,6 +1697,49 @@ runGravity() {
 create_pihole_user() {
     local str="Checking for user 'pihole'"
     printf "  %b %s..." "${INFO}" "${str}"
+
+    if is_macos; then
+        # macOS user/group management via dscl
+        if dscl . -read /Users/pihole &>/dev/null; then
+            printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
+        else
+            printf "%b  %b %s" "${OVER}" "${CROSS}" "${str}"
+            # Create pihole group if it doesn't exist
+            if ! dscl . -read /Groups/pihole &>/dev/null; then
+                local str="Creating group 'pihole'"
+                printf "  %b %s..." "${INFO}" "${str}"
+                # Find an unused GID (start from 500)
+                local gid=500
+                while dscl . -list /Groups PrimaryGroupID | awk '{print $2}' | grep -q "^${gid}$"; do
+                    gid=$((gid + 1))
+                done
+                dscl . -create /Groups/pihole
+                dscl . -create /Groups/pihole PrimaryGroupID "${gid}"
+                printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
+            fi
+            # Create pihole user
+            local str="Creating user 'pihole'"
+            printf "  %b %s..." "${INFO}" "${str}"
+            # Find an unused UID (start from 500)
+            local uid=500
+            while dscl . -list /Users UniqueID | awk '{print $2}' | grep -q "^${uid}$"; do
+                uid=$((uid + 1))
+            done
+            local pihole_gid
+            pihole_gid=$(dscl . -read /Groups/pihole PrimaryGroupID | awk '{print $2}')
+            dscl . -create /Users/pihole
+            dscl . -create /Users/pihole UniqueID "${uid}"
+            dscl . -create /Users/pihole PrimaryGroupID "${pihole_gid}"
+            dscl . -create /Users/pihole UserShell /usr/bin/false
+            dscl . -create /Users/pihole RealName "Pi-hole"
+            dscl . -create /Users/pihole NFSHomeDirectory /var/empty
+            # Hide the user from login window
+            dscl . -create /Users/pihole IsHidden 1
+            printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
+        fi
+        return
+    fi
+
     # If the pihole user exists,
     if id -u pihole &>/dev/null; then
         # and if the pihole group exists,
@@ -1590,8 +1815,8 @@ installLogrotate() {
 
         # Account for changed logfile paths from /var/log -> /var/log/pihole/ made in core v5.11.
         if grep -q "/var/log/pihole.log" ${target} || grep -q "/var/log/pihole-FTL.log" ${target}; then
-            sed -i 's/\/var\/log\/pihole.log/\/var\/log\/pihole\/pihole.log/g' ${target}
-            sed -i 's/\/var\/log\/pihole-FTL.log/\/var\/log\/pihole\/FTL.log/g' ${target}
+            sed_i 's/\/var\/log\/pihole.log/\/var\/log\/pihole\/pihole.log/g' ${target}
+            sed_i 's/\/var\/log\/pihole-FTL.log/\/var\/log\/pihole\/FTL.log/g' ${target}
 
             printf "\\n\\t%b Old log file paths updated in existing logrotate file. \\n" "${INFO}"
             logfileUpdate=true
@@ -1620,7 +1845,12 @@ nomail
     else
         # Copy the file over from the local repo
         # Logrotate config file must be owned by root and not writable by group or other
-        install -o root -g root -D -m 644 -T "${PI_HOLE_LOCAL_REPO}"/advanced/Templates/logrotate ${target}
+        if is_macos; then
+            install -m 644 "${PI_HOLE_LOCAL_REPO}"/advanced/Templates/logrotate ${target}
+            chown root:wheel ${target}
+        else
+            install -o root -g root -D -m 644 -T "${PI_HOLE_LOCAL_REPO}"/advanced/Templates/logrotate ${target}
+        fi
     fi
 
     # Different operating systems have different user / group
@@ -1629,11 +1859,15 @@ nomail
     # Rasbian and Ubuntu at the same time. Hence, we have to
     # customize the logrotate script here in order to reflect
     # the local properties of the /var/log directory
-    logusergroup="$(stat -c '%U %G' /var/log)"
+    if is_macos; then
+        logusergroup="$(stat -f '%Su %Sg' /var/log)"
+    else
+        logusergroup="$(stat -c '%U %G' /var/log)"
+    fi
     # If there is a usergroup for log rotation,
     if [[ -n "${logusergroup}" ]]; then
         # replace the line in the logrotate script with that usergroup.
-        sed -i "s/# su #/su ${logusergroup}/g;" ${target}
+        sed_i "s/# su #/su ${logusergroup}/g;" ${target}
     fi
     printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
 }
@@ -1876,7 +2110,13 @@ FTLinstall() {
         curl -sSL --fail "${url}/${binary}.sha1" -o "${binary}.sha1"
 
         # If we downloaded binary file (as opposed to text),
-        if sha1sum --status --quiet -c "${binary}".sha1; then
+        if is_macos; then
+            # macOS shasum uses -s for silent and -c for check (no --status or --quiet)
+            local sha1_check="shasum -a 1 -s -c"
+        else
+            local sha1_check="sha1sum --status --quiet -c"
+        fi
+        if ${sha1_check} "${binary}".sha1; then
             printf "transferred... "
 
             # Before stopping FTL, we download the macvendor database
@@ -1885,12 +2125,16 @@ FTLinstall() {
 
             # If the binary already exists in /usr/bin, then we need to stop the service
             # If the binary does not exist (fresh installs), then we can skip this step.
-            if [[ -f /usr/bin/pihole-FTL ]]; then
+            local ftl_binary_path="/usr/bin/pihole-FTL"
+            if is_macos; then
+                ftl_binary_path="/usr/local/bin/pihole-FTL"
+            fi
+            if [[ -f "${ftl_binary_path}" ]]; then
                 stop_service pihole-FTL >/dev/null
             fi
 
             # Install the new version with the correct permissions
-            install -T -m 0755 "${binary}" /usr/bin/pihole-FTL
+            install -T -m 0755 "${binary}" "${ftl_binary_path}"
 
             # Move back into the original directory the user was in
             popd >/dev/null || {
@@ -1947,6 +2191,23 @@ get_binary_name() {
 
     local str="Detecting processor"
     printf "  %b %s..." "${INFO}" "${str}"
+
+    # macOS architecture detection
+    if is_macos; then
+        if [[ "${machine}" == "arm64" ]]; then
+            printf "%b  %b Detected macOS ARM64 (Apple Silicon) architecture\\n" "${OVER}" "${TICK}"
+            l_binary="pihole-FTL-macOS-arm64"
+        elif [[ "${machine}" == "x86_64" ]]; then
+            printf "%b  %b Detected macOS x86_64 (Intel) architecture\\n" "${OVER}" "${TICK}"
+            l_binary="pihole-FTL-macOS-amd64"
+        else
+            printf "%b  %b %s...\\n" "${OVER}" "${CROSS}" "${str}"
+            printf "  %b %bUnsupported macOS architecture: %s%b\\n" "${INFO}" "${COL_RED}" "${machine}" "${COL_NC}"
+            l_binary=""
+        fi
+        echo "${l_binary}"
+        return
+    fi
 
     # If the machine is aarch64 (armv8)
     if [[ "${machine}" == "aarch64" ]]; then
@@ -2108,7 +2369,11 @@ FTLcheckUpdate() {
     # If we reach this point, we need to check the checksum of the local vs
     # remote to decide whether we download or not
     remoteSha1=$(curl -sSL --fail "${checkSumFile}" | cut -d ' ' -f 1)
-    localSha1=$(sha1sum "${ftlLoc}" | cut -d ' ' -f 1)
+    if is_macos; then
+        localSha1=$(shasum -a 1 "${ftlLoc}" | cut -d ' ' -f 1)
+    else
+        localSha1=$(sha1sum "${ftlLoc}" | cut -d ' ' -f 1)
+    fi
 
     # Check we downloaded a valid checksum (no 404 or other error like
     # no DNS resolution)
@@ -2155,7 +2420,12 @@ make_temporary_log() {
 copy_to_install_log() {
     # Copy the contents of file descriptor 3 into the install log
     # Since we use color codes such as '\e[1;33m', they should be removed
-    sed 's/\[[0-9;]\{1,5\}m//g' </proc/$$/fd/3 >"${installLogLoc}"
+    if is_macos; then
+        # macOS doesn't have /proc filesystem; redirect fd 3 via /dev/fd/
+        sed 's/\[[0-9;]\{1,5\}m//g' </dev/fd/3 >"${installLogLoc}" 2>/dev/null || true
+    else
+        sed 's/\[[0-9;]\{1,5\}m//g' </proc/$$/fd/3 >"${installLogLoc}"
+    fi
     chmod 644 "${installLogLoc}"
     chown pihole:pihole "${installLogLoc}"
 }
@@ -2239,6 +2509,14 @@ migrate_dnsmasq_configs() {
 
 # Check for availability of either the "service" or "systemctl" commands
 check_service_command() {
+    # macOS uses launchctl for service management
+    if is_macos; then
+        if ! is_command launchctl; then
+            printf "  %b launchctl is not available on this macOS system\\n" "${CROSS}"
+            exit 1
+        fi
+        return
+    fi
     # Check for the availability of the "service" command
     if ! is_command service && ! is_command systemctl; then
         # If neither the "service" nor the "systemctl" command is available, inform the user
@@ -2294,7 +2572,10 @@ main() {
     fi
 
     # Check if SELinux is Enforcing and exit before doing anything else
-    checkSelinux
+    # (SELinux does not exist on macOS)
+    if ! is_macos; then
+        checkSelinux
+    fi
 
     # Check for availability of either the "service" or "systemctl" commands
     check_service_command
@@ -2305,8 +2586,8 @@ main() {
     # Check for supported package managers so that we may install dependencies
     package_manager_detect
 
-    # Update package cache only on apt based systems
-    if is_command apt-get; then
+    # Update package cache only on apt and brew based systems
+    if is_command apt-get || { is_macos && is_command brew; }; then
             update_package_cache || exit 1
     fi
 
@@ -2379,7 +2660,11 @@ main() {
     fi
 
     # Install and log everything to a file
-    installPihole | tee -a /proc/$$/fd/3
+    if is_macos; then
+        installPihole | tee -a /dev/fd/3
+    else
+        installPihole | tee -a /proc/$$/fd/3
+    fi
 
     # /opt/pihole/utils.sh should be installed by installScripts now, so we can use it
     if [ -f "${PI_HOLE_INSTALL_DIR}/utils.sh" ]; then
