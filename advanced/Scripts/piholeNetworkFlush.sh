@@ -58,10 +58,19 @@ flushNetwork(){
 
 flushArp(){
     # Flush ARP cache of the host
-    if ! output=$(ip -s -s neigh flush all 2>&1); then
-        echo -e "${OVER}  ${CROSS} Failed to flush ARP cache"
-        echo "  Output: ${output}"
-        return 1
+    if is_macos; then
+        # macOS: use arp -d -a to flush ARP cache
+        if ! output=$(arp -d -a 2>&1); then
+            echo -e "${OVER}  ${CROSS} Failed to flush ARP cache"
+            echo "  Output: ${output}"
+            return 1
+        fi
+    else
+        if ! output=$(ip -s -s neigh flush all 2>&1); then
+            echo -e "${OVER}  ${CROSS} Failed to flush ARP cache"
+            echo "  Output: ${output}"
+            return 1
+        fi
     fi
 }
 

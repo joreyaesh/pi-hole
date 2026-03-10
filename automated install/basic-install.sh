@@ -285,6 +285,15 @@ is_macos() {
     [[ "$(uname -s)" == "Darwin" ]]
 }
 
+# Portable sed in-place editing for macOS (BSD) and GNU sed compatibility
+sed_i() {
+    if is_macos; then
+        sed -i '' "$@"
+    else
+        sed -i "$@"
+    fi
+}
+
 check_fresh_install() {
     # in case of an update (can be a v5 -> v6 or v6 -> v6 update) or repair
     if [[ -f "${PI_HOLE_V6_CONFIG}" ]] || [[ -f "/etc/pihole/setupVars.conf" ]]; then
@@ -631,7 +640,6 @@ find_IPv4_information() {
         local iface
         iface="$(echo "${route}" | awk '/interface:/ {print $2}')"
         # Get the IP address from ifconfig
-        printf -v IPv4bare "$(echo "${route}" | awk '/gateway:/ {next} /interface:/ {next} /if address/ {next}' | awk '/route to:/ {next}' | head -1)"
         IPv4bare="$(ifconfig "${iface}" 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $2}' | head -1)"
 
         if ! valid_ip "${IPv4bare}"; then
@@ -646,7 +654,7 @@ find_IPv4_information() {
             local cidr=0
             local hex_mask="${netmask#0x}"
             for (( i=0; i<${#hex_mask}; i++ )); do
-                local nibble="0x${hex_mask:$i:1}"
+                local nibble="0x${hex_mask:${i}:1}"
                 case $((nibble)) in
                     15) cidr=$((cidr+4)) ;; # f
                     14) cidr=$((cidr+3)) ;; # e
@@ -1216,7 +1224,7 @@ remove_old_pihole_lighttpd_configs() {
     local confenabled="/etc/lighttpd/conf-enabled/15-pihole-admin.conf"
 
     if [[ -f "${lighttpdConfig}" ]]; then
-        sed -i '/include "\/etc\/lighttpd\/conf.d\/pihole-admin.conf"/d' "${lighttpdConfig}"
+        sed_i '/include "\/etc\/lighttpd\/conf.d\/pihole-admin.conf"/d' "${lighttpdConfig}"
     fi
 
     if [[ -f "${condfd}" ]]; then
@@ -1804,8 +1812,8 @@ installLogrotate() {
 
         # Account for changed logfile paths from /var/log -> /var/log/pihole/ made in core v5.11.
         if grep -q "/var/log/pihole.log" ${target} || grep -q "/var/log/pihole-FTL.log" ${target}; then
-            sed -i 's/\/var\/log\/pihole.log/\/var\/log\/pihole\/pihole.log/g' ${target}
-            sed -i 's/\/var\/log\/pihole-FTL.log/\/var\/log\/pihole\/FTL.log/g' ${target}
+            sed_i 's/\/var\/log\/pihole.log/\/var\/log\/pihole\/pihole.log/g' ${target}
+            sed_i 's/\/var\/log\/pihole-FTL.log/\/var\/log\/pihole\/FTL.log/g' ${target}
 
             printf "\\n\\t%b Old log file paths updated in existing logrotate file. \\n" "${INFO}"
             logfileUpdate=true
@@ -1834,7 +1842,12 @@ nomail
     else
         # Copy the file over from the local repo
         # Logrotate config file must be owned by root and not writable by group or other
-        install -o root -g root -D -m 644 -T "${PI_HOLE_LOCAL_REPO}"/advanced/Templates/logrotate ${target}
+        if is_macos; then
+            install -m 644 "${PI_HOLE_LOCAL_REPO}"/advanced/Templates/logrotate ${target}
+            chown root:wheel ${target}
+        else
+            install -o root -g root -D -m 644 -T "${PI_HOLE_LOCAL_REPO}"/advanced/Templates/logrotate ${target}
+        fi
     fi
 
     # Different operating systems have different user / group
@@ -1851,7 +1864,7 @@ nomail
     # If there is a usergroup for log rotation,
     if [[ -n "${logusergroup}" ]]; then
         # replace the line in the logrotate script with that usergroup.
-        sed -i "s/# su #/su ${logusergroup}/g;" ${target}
+        sed_i "s/# su #/su ${logusergroup}/g;" ${target}
     fi
     printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
 }

@@ -781,18 +781,32 @@ dig_at() {
     #          Removes everything after @ (if found)
     #     s/: <.*//g;
     #          Removes everything after the interface name
-    interfaces="$(ip link show | sed "/ master /d;/UP/!d;s/^[0-9]*: //g;s/@.*//g;s/: <.*//g;")"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        # macOS: use ifconfig to get interfaces
+        interfaces="$(ifconfig -l -u | tr ' ' '\n' | grep -v '^lo')"
+    else
+        interfaces="$(ip link show | sed "/ master /d;/UP/!d;s/^[0-9]*: //g;s/@.*//g;s/: <.*//g;")"
+    fi
 
     while IFS= read -r iface ; do
         # Get addresses of current interface
-        # sed logic breakdown:
-        #     /inet(|6) /!d;
-        #          Removes all lines from ip a that do not contain either "inet " or "inet6 "
-        #     s/^.*inet(|6) //g;
-        #          Removes all leading whitespace as well as the "inet " or "inet6 " string
-        #     s/\/.*$//g;
-        #          Removes CIDR and everything thereafter (e.g., scope properties)
-        addresses="$(ip address show dev "${iface}" | sed "/${sed_selector} /!d;s/^.*${sed_selector} //g;s/\/.*$//g;")"
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            # macOS: use ifconfig to get addresses
+            if [[ "${sed_selector}" == "inet6" ]]; then
+                addresses="$(ifconfig "${iface}" 2>/dev/null | awk '/inet6 / && !/fe80/ && !/::1/ {print $2}' | sed 's/%.*$//')"
+            else
+                addresses="$(ifconfig "${iface}" 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $2}')"
+            fi
+        else
+            # sed logic breakdown:
+            #     /inet(|6) /!d;
+            #          Removes all lines from ip a that do not contain either "inet " or "inet6 "
+            #     s/^.*inet(|6) //g;
+            #          Removes all leading whitespace as well as the "inet " or "inet6 " string
+            #     s/\/.*$//g;
+            #          Removes CIDR and everything thereafter (e.g., scope properties)
+            addresses="$(ip address show dev "${iface}" | sed "/${sed_selector} /!d;s/^.*${sed_selector} //g;s/\/.*$//g;")"
+        fi
         if [ -n "${addresses}" ]; then
             while IFS= read -r local_address ; do
                 # If ${local_address} is an IPv6 link-local address, append the interface name to it

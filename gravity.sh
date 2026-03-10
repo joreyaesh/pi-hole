@@ -344,7 +344,18 @@ gravity_CheckDNSResolutionAvailable() {
   local lookupDomain="raw.githubusercontent.com"
 
   # Determine if $lookupDomain is resolvable
-  if timeout 4 getent hosts "${lookupDomain}" &>/dev/null; then
+  # macOS doesn't have getent; use host command instead
+  local dns_check_cmd="getent hosts"
+  local timeout_cmd="timeout"
+  if is_macos; then
+    dns_check_cmd="host"
+    # On macOS, timeout may be installed as gtimeout via Homebrew coreutils
+    if ! command -v timeout &>/dev/null && command -v gtimeout &>/dev/null; then
+      timeout_cmd="gtimeout"
+    fi
+  fi
+  # shellcheck disable=SC2086
+  if ${timeout_cmd} 4 ${dns_check_cmd} "${lookupDomain}" &>/dev/null; then
     echo -e "${OVER}  ${TICK} DNS resolution is available\\n"
     return 0
   else
@@ -356,7 +367,8 @@ gravity_CheckDNSResolutionAvailable() {
 
  # Default DNS timeout is two seconds, plus 1 second for each dot > 120 seconds
   for ((i = 0; i < 40; i++)); do
-      if getent hosts github.com &> /dev/null; then
+      # shellcheck disable=SC2086
+      if ${dns_check_cmd} github.com &> /dev/null; then
         # If we reach this point, DNS resolution is available
         echo -e "${OVER}  ${TICK} DNS resolution is available"
         return 0
@@ -587,11 +599,18 @@ gravity_DownloadBlocklists() {
 compareLists() {
   local adlistID="${1}" target="${2}"
 
+  # Portable sha1sum: use shasum on macOS, sha1sum on Linux
+  local SHA1SUM_CMD="sha1sum"
+  if is_macos; then
+    SHA1SUM_CMD="shasum -a 1"
+  fi
+
   # Verify checksum when an older checksum exists
   if [[ -s "${target}.sha1" ]]; then
-    if ! sha1sum --check --status --strict "${target}.sha1"; then
+    if ! ${SHA1SUM_CMD} --check --status --strict "${target}.sha1" 2>/dev/null && \
+       ! ${SHA1SUM_CMD} -c "${target}.sha1" --status 2>/dev/null; then
       # The list changed upstream, we need to update the checksum
-      sha1sum "${target}" >"${target}.sha1"
+      ${SHA1SUM_CMD} "${target}" >"${target}.sha1"
       fix_owner_permissions "${target}.sha1"
       echo "  ${INFO} List has been updated"
       database_adlist_status "${adlistID}" "1"
@@ -601,7 +620,7 @@ compareLists() {
     fi
   else
     # No checksum available, create one for comparing on the next run
-    sha1sum "${target}" >"${target}.sha1"
+    ${SHA1SUM_CMD} "${target}" >"${target}.sha1"
     fix_owner_permissions "${target}.sha1"
     # We assume here it was changed upstream
     database_adlist_status "${adlistID}" "1"
@@ -666,7 +685,13 @@ gravity_DownloadBlocklistFromUrl() {
       # Get IP address of this domain
       ip="$(dig "${domain}" +short)"
       # Check if this IP matches any IP of the system
-      if [[ -n "${ip}" && $(grep -Ec "inet(|6) ${ip}" <<<"$(ip a)") -gt 0 ]]; then
+      local all_ips
+      if is_macos; then
+        all_ips="$(ifconfig 2>/dev/null)"
+      else
+        all_ips="$(ip a)"
+      fi
+      if [[ -n "${ip}" && $(grep -Ec "inet(|6) ${ip}" <<<"${all_ips}") -gt 0 ]]; then
         blocked=true
       fi
       ;;
@@ -1035,7 +1060,7 @@ migrate_to_listsCache_dir() {
   fi
 
   # Update the list's paths in the corresponding .sha1 files to the new location
-  sed -i "s|${piholeDir}/|${listsCacheDir}/|g" "${listsCacheDir}"/*.sha1 2>/dev/null
+  sed_i "s|${piholeDir}/|${listsCacheDir}/|g" "${listsCacheDir}"/*.sha1 2>/dev/null
 }
 
 helpFunc() {
