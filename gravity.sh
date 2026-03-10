@@ -607,8 +607,19 @@ compareLists() {
 
   # Verify checksum when an older checksum exists
   if [[ -s "${target}.sha1" ]]; then
-    if ! ${SHA1SUM_CMD} --check --status --strict "${target}.sha1" 2>/dev/null && \
-       ! ${SHA1SUM_CMD} -c "${target}.sha1" --status 2>/dev/null; then
+    local check_failed=true
+    if is_macos; then
+      # macOS shasum uses -c for check and -s for silent mode (no --status or --strict)
+      if ${SHA1SUM_CMD} -s -c "${target}.sha1" 2>/dev/null; then
+        check_failed=false
+      fi
+    else
+      if sha1sum --check --status --strict "${target}.sha1"; then
+        check_failed=false
+      fi
+    fi
+
+    if [[ "${check_failed}" == true ]]; then
       # The list changed upstream, we need to update the checksum
       ${SHA1SUM_CMD} "${target}" >"${target}.sha1"
       fix_owner_permissions "${target}.sha1"

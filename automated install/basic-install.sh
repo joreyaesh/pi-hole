@@ -651,17 +651,17 @@ find_IPv4_information() {
         netmask="$(ifconfig "${iface}" 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $4}' | head -1)"
         if [[ -n "${netmask}" ]]; then
             # Convert hex netmask (0xffffff00) to CIDR prefix length
+            # Count the number of 1 bits in the binary representation
             local cidr=0
             local hex_mask="${netmask#0x}"
             for (( i=0; i<${#hex_mask}; i++ )); do
                 local nibble="0x${hex_mask:${i}:1}"
-                case $((nibble)) in
-                    15) cidr=$((cidr+4)) ;; # f
-                    14) cidr=$((cidr+3)) ;; # e
-                    12) cidr=$((cidr+2)) ;; # c
-                    8)  cidr=$((cidr+1)) ;; # 8
-                    0)  ;; # 0
-                esac
+                local val=$((nibble))
+                # Count set bits in each nibble (4-bit value)
+                while [[ ${val} -gt 0 ]]; do
+                    cidr=$((cidr + (val & 1)))
+                    val=$((val >> 1))
+                done
             done
             IPV4_ADDRESS="${IPv4bare}/${cidr}"
         else
@@ -1651,7 +1651,10 @@ installCron() {
         # Randomize update checker time
         sed -i '' "s/59 17/$((1 + RANDOM % 58)) $((12 + RANDOM % 8))/" "${tempCron}"
         # Remove the username field from cron entries (macOS crontab doesn't use it)
-        sed -i '' 's/\(^[0-9@][^ ]* [^ ]* [^ ]* [^ ]* [^ ]*\)  *root */\1 /' "${tempCron}"
+        # Handle standard 5-field entries (e.g., "59 1 * * 7  root  command")
+        sed -i '' 's/^\([0-9][^ ]* [^ ]* [^ ]* [^ ]* [^ ]*\)  *root */\1 /' "${tempCron}"
+        # Handle special time specifications (e.g., "@reboot root command")
+        sed -i '' 's/^\(@[a-zA-Z]*\)  *root */\1 /' "${tempCron}"
         # Install as root's crontab (merge with existing)
         local existingCron
         existingCron=$(crontab -l 2>/dev/null | grep -v "pihole" || true)
@@ -2108,7 +2111,8 @@ FTLinstall() {
 
         # If we downloaded binary file (as opposed to text),
         if is_macos; then
-            local sha1_check="shasum -a 1 --status --quiet -c"
+            # macOS shasum uses -s for silent and -c for check (no --status or --quiet)
+            local sha1_check="shasum -a 1 -s -c"
         else
             local sha1_check="sha1sum --status --quiet -c"
         fi
